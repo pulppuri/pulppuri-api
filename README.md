@@ -1,1 +1,1 @@
-# pulppuri_server
+# pulppuri_api

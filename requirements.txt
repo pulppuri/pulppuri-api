@@ -1,0 +1,6 @@
+fastapi
+numpy
+psycopg2-binary
+sentence_transformers
+uvicorn[standard]
+google-genai

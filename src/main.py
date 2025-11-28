@@ -4,6 +4,7 @@ from typing import Optional
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -12,7 +13,20 @@ from sentence_transformers import SentenceTransformer
 import env
 
 app = FastAPI()
-conn = conn = psycopg2.connect(host=env.PG_HOST,
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://172.20.99.51:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+conn = psycopg2.connect(host=env.PG_HOST,
                                port=env.PG_PORT,
                                database=env.PG_DATABASE,
                                user=env.PG_USERNAME,

@@ -1,8 +1,10 @@
 import json
 from base64 import b64decode, b64encode
 from typing import Optional
+from urllib.request import urlopen
 
 import psycopg2
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -276,7 +278,7 @@ def list_examples(q: Optional[str] = None, page: int = 1):
     offset = (page - 1) * PAGE_SIZE if page > 0 else 0
 
     with conn.cursor() as cur:
-        cur.execute("""SELECT examples.id, title, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+        cur.execute("""SELECT examples.id, title, thumbnail, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
                     FROM examples, regions, ex_tags, tags, users
                     WHERE examples.rid=regions.id AND examples.id=ex_tags.eid AND ex_tags.tid=tags.id AND examples.uid=users.id AND title LIKE %s
                     GROUP BY (examples.id, display_name, nickname)
@@ -284,26 +286,80 @@ def list_examples(q: Optional[str] = None, page: int = 1):
                     OFFSET %s ROWS
                     FETCH NEXT %s ROWS ONLY;""",
                     (query, offset, PAGE_SIZE))
-        results = [ { "id": id, "title": title, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
-                    for id, title, content, region, cat, nickname in cur.fetchall() ]
+        results = [ { "id": id, "title": title, "thumbnail": thumbnail, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, title, thumbnail, content, region, cat, nickname in cur.fetchall() ]
 
     return { "examples": results }
 
+class ExDto(BaseModel):
+    rid: int
+    title: str
+    thumbnail: Optional[str] = None
+    content: str
+    reference: str
+    tags: list[str]
+
 @app.post("/examples")
-def create_example():
-    pass
+def create_example(ex_dto: ExDto, authorization: Optional[str] = Header(default=None)):
+    if not authorization:
+        raise HTTPException(401, "Authorization header not found")
+    elif not (token:=parse_token(authorization)):
+        raise HTTPException(403, "Authorization failed")
+
+    uid = token["uid"]
+    vec = model.encode(ex_dto.content)
+    vec_str = f"[{','.join(map(str, vec))}]"
+    with conn.cursor() as cur:
+        cur.execute("""WITH eids AS (
+                    INSERT INTO examples (rid, uid, title, thumbnail, content, reference, vec) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id)
+                    INSERT INTO ex_tags (eid, tid) SELECT eids.id, tags.id FROM eids, tags WHERE name IN %s RETURNING eid;""", (ex_dto.rid, uid, ex_dto.title, ex_dto.thumbnail, ex_dto.content, ex_dto.reference, vec_str, tuple(ex_dto.tags)))
+        results = cur.fetchall()
+
+    conn.commit()
+    if len(results) == 0:
+        raise HTTPException(500)
+    else:
+        return { "eid": results[0][0] }
 
 @app.get("/examples/{eid}")
 def get_example(eid: int):
     with conn.cursor() as cur:
-        cur.execute("""SELECT examples.id, title, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+        cur.execute("""SELECT examples.id, title, thumbnail, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
                     FROM examples, regions, ex_tags, tags, users
                     WHERE examples.rid=regions.id AND examples.id=ex_tags.eid AND ex_tags.tid=tags.id AND examples.uid=users.id AND eid=%s
                     GROUP BY (examples.id, display_name, nickname);""", (eid, ))
-        results = [ { "id": id, "title": title, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
-                    for id, title, content, region, cat, nickname in cur.fetchall() ]
+        results = [ { "id": id, "title": title, "thumbnail": thumbnail, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, title, thumbnail, content, region, cat, nickname in cur.fetchall() ]
 
     if len(results) == 0:
         raise HTTPException(404, "No such eid")
     else:
         return results[0]
+
+class AutofillDto(BaseModel):
+    url: str
+
+@app.post("/autofill")
+def create_autofill(auto_dto: AutofillDto):
+    url = auto_dto.url
+
+    try:
+        with urlopen(url) as f:
+            doc = f.read()
+            soup = BeautifulSoup(doc)
+            tag = soup.select_one("meta[property='og:image']")
+            thumbnail = tag.get("content") if tag is not None else None
+
+        prompt = "첨부된 인터넷 신문 기사를 마크다운(.md) 형식으로 요약해줘. 만일 실패할 경우 아무 문자열도 반환하지 마. "
+        result = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[
+                types.Part.from_bytes(data=doc, mime_type="text/html"),
+                prompt
+            ]
+        )
+
+        return { "content": result.text, "thumbnail": thumbnail }
+    except BaseException as e:
+        raise HTTPException(500, e)
+    pass

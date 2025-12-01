@@ -49,7 +49,7 @@ def setup_examples(conn: connection):
             tags = tuple(tags.split())
             cur.execute("""WITH eids AS (
                         INSERT INTO examples (rid, uid, title, content, reference, vec) SELECT (SELECT id FROM regions WHERE full_name=%s), %s, %s, %s, %s, %s RETURNING id)
-                        INSERT INTO ex_tags (eid, tid) SELECT eids.id, tags.id FROM eids, tags WHERE name IN %s;""", (region, 0, title, content, ref, vec, tags))
+                        INSERT INTO ex_tags (eid, tid) SELECT eids.id, tags.id FROM eids, tags WHERE name IN %s;""", (region, 1, title, content, ref, vec, tags))
 
 
 if __name__ == "__main__":
@@ -107,9 +107,9 @@ if __name__ == "__main__":
                 rid INTEGER NOT NULL,
                 uid INTEGER NOT NULL,
                 title TEXT NOT NULL,
-                prob_def TEXT NOT NULL,
-                sugg_met TEXT NOT NULL,
-                expt_eff TEXT NOT NULL,
+                problem TEXT NOT NULL,
+                method TEXT NOT NULL,
+                effect TEXT NOT NULL,
                 read_cnt INTEGER NOT NULL DEFAULT 0
     );""")
     cur.execute("""CREATE TABLE pr_tags (
@@ -128,5 +128,6 @@ if __name__ == "__main__":
     cur.execute("""INSERT INTO tags (name) VALUES
                 ('교육'), ('교통'), ('농촌'), ('문화'), ('복지'), ('주거'), ('청년');""")
     setup_regions(conn)
+    cur.execute("""INSERT INTO users (age, job, rid, gender, nickname) VALUES (20, '기자', 11859, '남성', '옥천신문');""")
     setup_examples(conn)
     conn.commit()

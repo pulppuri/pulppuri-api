@@ -26,7 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-conn = psycopg2.connect(host=env.PG_HOST,
+conn = conn = psycopg2.connect(host=env.PG_HOST,
                                port=env.PG_PORT,
                                database=env.PG_DATABASE,
                                user=env.PG_USERNAME,
@@ -89,7 +89,7 @@ async def create_user(user_dto: UserDto):
         if result:
             uid = result[0]
         else:
-            return { "error": "rid does not exist" }
+            raise HTTPException(400, "No such rid")
 
     conn.commit()
 
@@ -160,6 +160,115 @@ def list_guidelines(prob_def: ProbDefDto, authorization: Optional[str] = Header(
         "guidelines": json.loads(guildlines)
     }
 
+@app.get("/proposals")
+def list_proposal(q: Optional[str] = None, page: int = 1):
+    PAGE_SIZE = 10
+    query = f"%{q}%" if q else "%%"
+    offset = (page - 1) * PAGE_SIZE if page > 0 else 0
+
+    with conn.cursor() as cur:
+        cur.execute("""SELECT proposals.id, title, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+                    FROM proposals, regions, pr_tags, tags, users
+                    WHERE proposals.rid=regions.id AND proposals.id=pr_tags.pid AND pr_tags.tid=tags.id AND proposals.uid=users.id AND title LIKE %s
+                    GROUP BY (proposals.id, display_name, nickname)
+                    ORDER BY proposals.id DESC
+                    OFFSET %s ROWS
+                    FETCH NEXT %s ROWS ONLY;""",
+                    (query, offset, PAGE_SIZE))
+        results = [ { "id": id, "title": title, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, title, region, cat, nickname in cur.fetchall() ]
+
+    return { "proposals": results }
+
+class ProposalDto(BaseModel):
+    rid: int
+    title: str
+    eid: Optional[int] = None
+    problem: str
+    method: str
+    effect: str
+    tags: list[str]
+
+@app.post("/proposals")
+def create_proposal(pro_dto: ProposalDto, authorization: Optional[str] = Header(default=None)):
+    if not authorization:
+        raise HTTPException(401, "Authorization header not found")
+    elif not (token:=parse_token(authorization)):
+        raise HTTPException(403, "Authorization failed")
+
+    uid = token["uid"]
+    with conn.cursor() as cur:
+        cur.execute("""WITH pids AS (
+                    INSERT INTO proposals (eid, rid, uid, title, problem, method, effect) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id)
+                    INSERT INTO pr_tags (pid, tid) SELECT pids.id, tags.id FROM pids, tags WHERE name IN %s RETURNING pid;""", (pro_dto.eid, pro_dto.rid, uid, pro_dto.title, pro_dto.problem, pro_dto.method, pro_dto.effect, tuple(pro_dto.tags)))
+        results = cur.fetchall()
+    conn.commit()
+    if len(results) == 0:
+        raise HTTPException(500)
+    else:
+        return { "pid": results[0][0] }
+
+@app.get("/proposals/{pid}")
+def get_proposal(pid: int):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT proposals.id, eid, title, problem, method, effect, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+                    FROM proposals, regions, pr_tags, tags, users
+                    WHERE proposals.rid=regions.id AND proposals.id=pr_tags.pid AND pr_tags.tid=tags.id AND proposals.uid=users.id AND proposals.id=%s
+                    GROUP BY (proposals.id, display_name, nickname);""",
+                    (pid, ))
+        results = [ { "id": id, "eid": eid, "title": title, "problem": problem, "method": method, "effect": effect, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, eid, title, problem, method, effect, region, cat, nickname in cur.fetchall() ]
+
+    return { "proposal": results[0] }
+
+class HelperDto(BaseModel):
+    title: str
+    problem: str
+    method: str
+    effect: str
+
+class HelperResDto(BaseModel):
+    problem: str
+    method: str
+    effect: str
+
+@app.post("/helper")
+def helper(pro_dto: HelperDto):
+    prompt = f"""당신은 정부/기관 대상의 정책 제안서 전문 편집자입니다. 사용자로부터 정책 제안서의 초안을 "제목", "문제 정의", "해결 방법", "기대 효과"의 4가지 섹션으로 구분하여 전달받았습니다.
+    당신의 목표는 이 초안의 내용을 해치지 않으면서 설득력, 명확성, 논리적 흐름을 극대화하여 내용을 가장 효과적으로 전달할 수 있도록 전문적으로 교정하는 것입니다.
+
+    **[구체적인 교정 지침]**
+    1.  **문제 정의:** 현 상황의 심각성과 필요성을 강조하고, 문제의 범위와 현행 정책의 한계를 명확히 제시하여 제안의 당위성을 확보하도록 교정합니다.
+    2.  **해결 방법:** 방법론을 단계별로 명확히 나누고, '문제 정의'에서 언급된 문제를 어떻게 직접적으로 해결하는지 논리적인 연결 고리를 강화하며, 실현 가능성과 구체성을 높이도록 다듬습니다.
+    3.  **기대 효과:** 효과를 정량적/정성적으로 구분하여 제시하고, 수혜자(정책 대상, 사회, 정부)별로 분류하여 임팩트를 강조합니다.
+    4.  **전반:** 섹션 간의 논리적 흐름과 유기적인 연결을 매끄럽게 하고, 명확하고 간결하며 공식적인 어휘를 사용합니다.
+
+    **[출력 요구 사항]**
+    * 교정된 결과는 **JSON**을 사용하여 **"문제 정의", "해결 방법", "기대 효과"**의 세 가지 섹션으로 출력합니다.
+
+    **[정책 제안서 초안]**
+
+    ## 제목
+    {pro_dto.title}
+
+    ## 문제 정의
+    {pro_dto.problem}
+
+    ## 해결 방법
+    {pro_dto.method}
+
+    ## 기대 효과
+    {pro_dto.effect}
+    """
+    guildlines = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={ "response_mime_type": "application/json",
+                 "response_json_schema": HelperResDto.model_json_schema() }
+    ).text or "{}"
+
+    return guildlines
+
 @app.get("/examples")
 def list_examples(q: Optional[str] = None, page: int = 1):
     PAGE_SIZE = 10
@@ -167,15 +276,34 @@ def list_examples(q: Optional[str] = None, page: int = 1):
     offset = (page - 1) * PAGE_SIZE if page > 0 else 0
 
     with conn.cursor() as cur:
-        cur.execute("""SELECT examples.id, title, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories
-                    FROM examples, regions, ex_tags, tags
-                    WHERE examples.rid=regions.id AND examples.id=ex_tags.eid AND ex_tags.tid=tags.id AND title LIKE %s
-                    GROUP BY (examples.id, display_name)
+        cur.execute("""SELECT examples.id, title, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+                    FROM examples, regions, ex_tags, tags, users
+                    WHERE examples.rid=regions.id AND examples.id=ex_tags.eid AND ex_tags.tid=tags.id AND examples.uid=users.id AND title LIKE %s
+                    GROUP BY (examples.id, display_name, nickname)
                     ORDER BY examples.id DESC
                     OFFSET %s ROWS
                     FETCH NEXT %s ROWS ONLY;""",
                     (query, offset, PAGE_SIZE))
-        results = [ { "id": id, "title": title, "region": region, "categories": cat.split(",") }
-                    for id, title, region, cat in cur.fetchall() ]
+        results = [ { "id": id, "title": title, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, title, content, region, cat, nickname in cur.fetchall() ]
 
     return { "examples": results }
+
+@app.post("/examples")
+def create_example():
+    pass
+
+@app.get("/examples/{eid}")
+def get_example(eid: int):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT examples.id, title, content, display_name AS region, STRING_AGG(name, ',' ORDER BY name) AS categories, nickname
+                    FROM examples, regions, ex_tags, tags, users
+                    WHERE examples.rid=regions.id AND examples.id=ex_tags.eid AND ex_tags.tid=tags.id AND examples.uid=users.id AND eid=%s
+                    GROUP BY (examples.id, display_name, nickname);""", (eid, ))
+        results = [ { "id": id, "title": title, "content": content, "region": region, "categories": cat.split(","), "nickname": nickname }
+                    for id, title, content, region, cat, nickname in cur.fetchall() ]
+
+    if len(results) == 0:
+        raise HTTPException(404, "No such eid")
+    else:
+        return results[0]
